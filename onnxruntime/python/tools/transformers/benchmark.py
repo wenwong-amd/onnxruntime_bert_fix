@@ -114,7 +114,16 @@ def run_onnxruntime(
     import onnxruntime  # noqa: PLC0415
 
     results = []
-    if (
+    provider_options = None
+    if use_gpu and provider == "migraphx":
+        from migraphx_ep import MIGRAPHX_EP, is_builtin_migraphx_ep, register_migraphx_ep  # noqa: PLC0415
+
+        # Plugin EP builds only expose MIGraphX after its library is registered; raises if unavailable.
+        register_migraphx_ep()
+        # The MIGraphX plugin EP rejects this option; only the built-in EP supports it.
+        if is_builtin_migraphx_ep():
+            provider_options = {MIGRAPHX_EP: {"migraphx_max_dynamic_batch": str(max(batch_sizes))}}
+    elif (
         use_gpu
         and ("CUDAExecutionProvider" not in onnxruntime.get_available_providers())
         and ("MIGraphXExecutionProvider" not in onnxruntime.get_available_providers())
@@ -205,8 +214,6 @@ def run_onnxruntime(
 
             if not is_valid_onnx_model:
                 continue
-
-            provider_options = {"MIGraphXExecutionProvider": {"migraphx_max_dynamic_batch": str(max(batch_sizes))}} if provider == "migraphx" else None
 
             ort_session = create_onnxruntime_session(
                 onnx_model_file,
