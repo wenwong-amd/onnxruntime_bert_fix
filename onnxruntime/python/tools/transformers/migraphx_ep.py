@@ -41,24 +41,29 @@ except AttributeError:
     MIGRAPHX_VENDOR_ID = 0x1002  # AMD PCI vendor ID fallback
 
 
-def _find_migraphx_plugin_lib():
-    """Locate the MIGraphX plugin EP shared library.
+def _find_migraphx_plugin_libs(registration_name):
+    """Return (registration_name, library_path) pairs for the MIGraphX plugin EP library.
 
     Resolution order:
       1. Explicit override via the MIGRAPHX_EP_LIB environment variable.
       2. The separately-installable 'onnxruntime_ep_migraphx' package (built by
-         onnxruntime-ep-amdgpu), which exposes get_library_path().
+         onnxruntime-ep-amdgpu), which exposes get_ep_names()/get_library_paths()
+         (or get_library_path() in older releases).
       3. Inside the onnxruntime package itself, for builds that ship the plugin
          EP library alongside the classic provider libraries.
     """
     override = os.environ.get("MIGRAPHX_EP_LIB")
     if override:
-        return override
+        return [(registration_name, override)]
 
     try:
         import onnxruntime_ep_migraphx  # noqa: PLC0415
 
-        return onnxruntime_ep_migraphx.get_library_path()
+        if hasattr(onnxruntime_ep_migraphx, "get_library_paths"):
+            return list(
+                zip(onnxruntime_ep_migraphx.get_ep_names(), onnxruntime_ep_migraphx.get_library_paths(), strict=True)
+            )
+        return [(registration_name, onnxruntime_ep_migraphx.get_library_path())]
     except (ImportError, FileNotFoundError, AttributeError):
         pass
 
@@ -70,37 +75,52 @@ def _find_migraphx_plugin_lib():
     for pattern in patterns:
         matches = glob.glob(os.path.join(package_dir, pattern))
         if matches:
-            return matches[0]
-    return None
+            return [(registration_name, matches[0])]
+    return []
 
 
-def _find_migraphx_ep_device(registration_name):
-    """Return the OrtEpDevice registered under `registration_name`, if any."""
+def _find_migraphx_ep_device():
+    """Return the MIGraphX OrtEpDevice provided by a registered plugin EP library, if any."""
     if not hasattr(onnxruntime, "get_ep_devices"):
         return None
     for ep_device in onnxruntime.get_ep_devices():
-        if ep_device.ep_name == registration_name:
+        if ep_device.ep_name == MIGRAPHX_EP:
             return ep_device
     return None
 
 
+def is_builtin_migraphx_ep():
+    # Newer onnxruntime also lists registered plugin EPs in get_available_providers(),
+    # so only treat MIGraphX as built-in when no plugin OrtEpDevice backs it.
+    return MIGRAPHX_EP in onnxruntime.get_available_providers() and _find_migraphx_ep_device() is None
+
+
 def _register_migraphx_plugin(registration_name):
+    ep_device = _find_migraphx_ep_device()
+    if ep_device is not None:
+        return ep_device
+
     if not hasattr(onnxruntime, "register_execution_provider_library"):
         raise RuntimeError(
             f"This onnxruntime ({onnxruntime.__version__}) has neither a "
             f"built-in MIGraphX EP nor the plugin registration API"
         )
 
-    lib_path = _find_migraphx_plugin_lib()
-    if lib_path is None:
+    libs = _find_migraphx_plugin_libs(registration_name)
+    if not libs:
         raise RuntimeError("MIGraphX plugin EP library not found; set MIGRAPHX_EP_LIB to its path")
 
-    onnxruntime.register_execution_provider_library(registration_name, lib_path)
+    # migraphx must be imported before loading the plugin EP library to initialize the ROCm runtime.
+    import migraphx  # noqa: F401, PLC0415
 
-    ep_device = _find_migraphx_ep_device(registration_name)
+    for name, lib_path in libs:
+        onnxruntime.register_execution_provider_library(name, lib_path)
+
+    ep_device = _find_migraphx_ep_device()
     if ep_device is None:
+        lib_paths = [lib_path for _, lib_path in libs]
         raise RuntimeError(
-            f"Registered MIGraphX plugin EP from '{lib_path}' but no matching "
+            f"Registered MIGraphX plugin EP from {lib_paths} but no matching "
             f"OrtEpDevice was found (see onnxruntime.get_ep_devices()). This "
             f"usually means ONNX Runtime's hardware device discovery didn't "
             f"find a usable GPU for the plugin EP to attach to -- check the "
@@ -124,7 +144,7 @@ def register_migraphx_ep(registration_name=MIGRAPHX_EP):
     SessionOptions instead), this still registers the library but callers must use
     ``ensure_migraphx_ep(session_options, ...)`` to actually select the device.
     """
-    if MIGRAPHX_EP in onnxruntime.get_available_providers():
+    if is_builtin_migraphx_ep():
         return
 
     if hasattr(onnxruntime, "register_execution_provider_library"):
@@ -151,17 +171,17 @@ def ensure_migraphx_ep(session_options, provider_options=None, registration_name
     (plugin EP path) to attach the MIGraphX device.
 
     provider_options: optional dict of MIGraphX EP options (e.g.
-    {"migraphx_fp16_enable": "1"}). The plugin EP accepts both the classic EP's
-    "migraphx_"-prefixed names and its own unprefixed names natively (see
-    onnxruntime-ep-amdgpu's mgx_options.h kLegacyOptionAliases), so no
-    translation is needed here.
+    {"migraphx_fp16_enable": "1"}). The plugin EP accepts its own unprefixed names
+    and the classic EP's "migraphx_"-prefixed names listed in onnxruntime-ep-amdgpu's
+    mgx_options.h kLegacyOptionAliases; other classic-only options (e.g.
+    migraphx_max_dynamic_batch) are rejected with EP_FAIL at session creation.
 
     Returns the 'providers' list to pass as InferenceSession(providers=...).
     On the plugin EP path this is None, since the provider is already configured
     on `session_options`; pass it through as-is (InferenceSession treats
     providers=None as "use what's on session_options").
     """
-    if MIGRAPHX_EP in onnxruntime.get_available_providers():
+    if is_builtin_migraphx_ep():
         # Classic built-in EP: select it via the standard providers list.
         if provider_options:
             return [(MIGRAPHX_EP, provider_options)]
